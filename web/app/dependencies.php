@@ -42,8 +42,18 @@ return function (ContainerBuilder $containerBuilder) {
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
             ];
             if ($db["engine"] === "sqlite") {
+                // SQLite silently creates missing files; refuse an uninitialized deployment.
+                if (! is_file($db["sqlite_path"])) {
+                    throw new DomainException("SQLite database is missing; run schema initialization first.");
+                }
                 $connection = new PDO("sqlite:" . $db["sqlite_path"], null, null, $options);
                 $connection->exec("PRAGMA busy_timeout = 10000");
+                if ($connection->query("PRAGMA journal_mode")->fetchColumn() !== "wal") {
+                    throw new DomainException("SQLite database must use WAL journal mode.");
+                }
+                foreach (["users", "sessions", "hnpairs", "motd"] as $table) {
+                    $connection->query("SELECT * FROM {$table} LIMIT 0");
+                }
                 return $connection;
             }
             if ($db["engine"] !== "mysql") {
