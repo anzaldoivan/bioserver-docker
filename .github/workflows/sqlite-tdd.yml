@@ -53,3 +53,46 @@ jobs:
         run: php -r 'if (!in_array("des-ecb", openssl_get_cipher_methods(), true)) { fwrite(STDERR, "DES-ECB unavailable; check OPENSSL_CONF legacy provider\n"); exit(1); }'
       - working-directory: web
         run: composer test
+
+  php-mysql-regression:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:9.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bioserver
+          MYSQL_USER: bioserver
+          MYSQL_PASSWORD: bioserver
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      APP_ENV: production
+      FORCE_DEV_LOGIN: 'false'
+      DB_ENGINE: mysql
+      DB_USER: bioserver
+      DB_PASSWORD: bioserver
+      DB_HOST: 127.0.0.1
+      DB_DATABASE: bioserver
+      OPENSSL_CONF: ${{ github.workspace }}/docker/vars/web/openssl.cnf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_mysql, mbstring
+          tools: composer:v2
+      - name: Initialize real MySQL schema
+        run: |
+          docker exec -i "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
+      - name: Install PHP dependencies
+        working-directory: web
+        run: composer install --no-interaction --prefer-dist
+      - name: Verify legacy DNAS cipher
+        run: php -r 'if (!in_array("des-ecb", openssl_get_cipher_methods(), true)) { exit(1); }'
+      - name: Run MySQL PHP regressions
+        working-directory: web
+        run: composer test
