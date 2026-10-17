@@ -88,40 +88,39 @@ class GameServerPacketHandler implements Runnable {
     
     // here comes the raw packet data and is tranformed into messages
     void processData(GameServerThread server, SocketChannel socket, byte[] data, int count) {
-        if(count > 0) {
-            switch(data[0]) {
-                case (byte)0x82:
-                    if(data[1] == 0x02) {
-                        // some session checking etc.
-                        Packet p = new Packet(data);
-                        if(p.getCmd() == Commands.GSLOGIN) {
-                            // check this session and if ok create client
-                            if(!check_session(server, socket, p)) {
-                                Logging.println("Session check gameserver failed!");
-                            }
-                        }
-                    }
-                    break;
+        if (data == null || count <= 0 || count > data.length) return;
 
-                default:
-                    // broadcast to connected clients in gamesession but not the sender
-                    byte[] acopy = new byte[count];
-                    System.arraycopy(data, 0, acopy, 0, count);
-
-                    Client cl = clients.findClient(socket);
-                    cl.connalive = true;
-                    int gamenum = cl.gamenumber;
-                    List cls = clients.getList();
-                    synchronized(queue) {
-                        for(int i=0; i<cls.size(); i++) {
-                            cl = (Client) cls.get(i);
-                            if(cl.gamenumber==gamenum && cl.getSocket()!=socket) {
-                                queue.add(new GameServerDataEvent(server, cl.getSocket(), acopy));
-                            }
-                        }
-                        queue.notify();
-                    }
+        // 0x82 is ALSO a legal unsigned gameplay-frame length (130 bytes).
+        // Only the complete 0x82 0x02 0x10 0x31 GSLOGIN frame is a control
+        // message. All other lengths, including 0x82, use game-scoped relay.
+        if (GameServerFrame.isCompleteLogin(data, 0, count)) {
+            Packet packet = new Packet(data);
+            if (packet.getCmd() == Commands.GSLOGIN) {
+                if (!check_session(server, socket, packet)) {
+                    Logging.println("Session check gameserver failed!");
                 }
+            }
+            return;
+        }
+
+        // Do not allow sockets which have not completed GSLOGIN to inject
+        // traffic into someone else's game.
+        Client sender = clients.findClient(socket);
+        if (sender == null) return;
+        sender.connalive = true;
+        int gamenum = sender.gamenumber;
+
+        byte[] forwarded = new byte[count];
+        System.arraycopy(data, 0, forwarded, 0, count);
+        List peers = clients.getList();
+        synchronized (queue) {
+            for (int i = 0; i < peers.size(); ++i) {
+                Client peer = (Client) peers.get(i);
+                if (peer.gamenumber == gamenum && peer.getSocket() != socket) {
+                    queue.add(new GameServerDataEvent(server, peer.getSocket(), forwarded));
+                }
+            }
+            queue.notify();
         }
     }
 
