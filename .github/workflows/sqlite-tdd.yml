@@ -33,7 +33,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-python-sqlite
-          path: reports/python/sqlite
+          path: reports
           if-no-files-found: warn
 
   php-regression:
@@ -109,7 +109,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-php-${{ matrix.engine }}
-          path: reports/php/${{ matrix.engine }}
+          path: reports
           if-no-files-found: warn
 
   java-db-smoke:
@@ -186,7 +186,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-java
-          path: reports/java
+          path: reports
           if-no-files-found: warn
 
   coverage-report:
@@ -205,7 +205,7 @@ jobs:
           merge-multiple: true
       - name: Generate separated coverage summary
         run: |
-          python tests/coverage/aggregate.py coverage-input | tee coverage-summary.md
+          python tests/coverage/aggregate.py --require coverage-input | tee coverage-summary.md
           cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Archive aggregated reports
         if: always()
@@ -221,6 +221,6 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ env.CODECOV_TOKEN }}
-          files: coverage-input/reports/php/sqlite/cobertura.xml,coverage-input/reports/php/mysql/cobertura.xml,coverage-input/reports/python/sqlite/coverage.xml,coverage-input/reports/java/bio1/jacoco.xml,coverage-input/reports/java/bio2/jacoco.xml
+          files: coverage-input/php/sqlite/cobertura.xml,coverage-input/php/mysql/cobertura.xml,coverage-input/python/sqlite/coverage.xml,coverage-input/java/bio1/jacoco.xml,coverage-input/java/bio2/jacoco.xml
           flags: bioserver-ci
           fail_ci_if_error: false

@@ -5,11 +5,11 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 REPORTS = (
-    ("PHP / SQLite", "reports/php/sqlite/cobertura.xml", "cobertura"),
-    ("PHP / MySQL", "reports/php/mysql/cobertura.xml", "cobertura"),
-    ("SQLite initializer / Python", "reports/python/sqlite/coverage.xml", "cobertura"),
-    ("File #1 JDBC / Java", "reports/java/bio1/jacoco.xml", "jacoco"),
-    ("File #2 JDBC / Java", "reports/java/bio2/jacoco.xml", "jacoco"),
+    ("PHP / SQLite", "php/sqlite/cobertura.xml", "cobertura"),
+    ("PHP / MySQL", "php/mysql/cobertura.xml", "cobertura"),
+    ("SQLite initializer / Python", "python/sqlite/coverage.xml", "cobertura"),
+    ("File #1 JDBC / Java", "java/bio1/jacoco.xml", "jacoco"),
+    ("File #2 JDBC / Java", "java/bio2/jacoco.xml", "jacoco"),
 )
 
 
@@ -57,4 +57,14 @@ def render(base: Path) -> str:
 
 
 if __name__ == "__main__":
-    print(render(Path(sys.argv[1] if len(sys.argv) > 1 else ".")), end="")
+    args = sys.argv[1:]
+    required = "--require" in args
+    args = [arg for arg in args if arg != "--require"]
+    base = Path(args[0] if args else ".")
+    print(render(base), end="")
+    if required:
+        missing = [str(base / name) for _, name, _ in REPORTS
+                   if not (base / name).is_file()]
+        if missing:
+            print("Missing required coverage XML: " + ", ".join(missing), file=sys.stderr)
+            raise SystemExit(1)
