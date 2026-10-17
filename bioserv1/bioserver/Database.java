@@ -1,411 +1,255 @@
-/*
-    BioServer - Emulation of the long gone server for 
-                Biohazard Outbreak File #1 (Playstation 2)
-
-    Copyright (C) 2013-2019 obsrv.org (no23@deathless.net)
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU Affero General Public License as published
-    by the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    You should have received a copy of the GNU Affero General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
-
 package bioserver;
 
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.io.UnsupportedEncodingException;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import java.sql.Statement;
 
 /**
- * class for managing the database
+ * JDBC persistence for both Outbreak game servers.
+ *
+ * MySQL remains the default. SQLite is opt-in via DB_ENGINE=sqlite and
+ * DB_SQLITE_PATH; the file must have been initialized before startup.
+ * All SQL inputs are bound, especially leading-zero game IDs and SJIS names.
  */
-public class Database {
-    private String url;
-    private String user;
-    private String password;
-    private String host;
-    private String params;
-    private String database;
-    
-    private Connection con = null;
-    
-    // simple constructor to create a reusable connection to the database
-    public Database(
-        String db_user, 
-        String db_password, 
-        String db_host, 
-        String db_params,
-        String db_database
-    ) {
-        this.user = db_user;
-        this.password = db_password;
-        this.host = db_host;
-        this.params = db_params;
-        this.database = db_database;
-        this.url = String.format(
-            "jdbc:mysql://%s:3306/%s?useUnicode=true&characterEncoding=UTF-8%s",
-            this.host,
-            this.database,
-            this.params
-        );
+public class Database implements AutoCloseable {
+    private final String url;
+    private final String user;
+    private final String password;
+    private final boolean sqlite;
+    private Connection con;
 
-        try {
-            con = (Connection) DriverManager.getConnection(url, user, password);
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
+    public Database(String dbUser, String dbPassword, String dbHost, String dbParams, String dbDatabase) {
+        String engine = System.getenv().getOrDefault("DB_ENGINE", "mysql");
+        if ("sqlite".equalsIgnoreCase(engine)) {
+            sqlite = true;
+            String path = System.getenv().getOrDefault("DB_SQLITE_PATH", "/var/lib/bioserver/bioserver.sqlite");
+            if (!Path.of(path).isAbsolute() || !Files.isRegularFile(Path.of(path))) {
+                throw new IllegalStateException("SQLite DB_SQLITE_PATH must point to an initialized absolute-path file: " + path);
+            }
+            url = "jdbc:sqlite:" + path;
+            user = "";
+            password = "";
+        } else if ("mysql".equalsIgnoreCase(engine)) {
+            sqlite = false;
+            url = String.format(
+                "jdbc:mysql://%s:3306/%s?useUnicode=true&characterEncoding=UTF-8%s",
+                dbHost, dbDatabase, dbParams == null ? "" : dbParams
+            );
+            user = dbUser;
+            password = dbPassword;
+        } else {
+            throw new IllegalArgumentException("Unsupported DB_ENGINE: " + engine);
         }
-        
-        // setup some things on server restart
-        // set area to -1, rooms, slots and gamesessions to 0
-        this.setupDBrestart();
+
+        con = openConnection();
+        setupDBrestart();
     }
-    
-    
-    // test connection and create a new one on failure
+
+    private Connection openConnection() {
+        try {
+            Connection opened = sqlite ? DriverManager.getConnection(url)
+                                       : DriverManager.getConnection(url, user, password);
+            try {
+                if (sqlite) {
+                    try (Statement stmt = opened.createStatement()) {
+                        stmt.execute("PRAGMA busy_timeout=10000");
+                        stmt.execute("PRAGMA foreign_keys=ON");
+                        try (ResultSet mode = stmt.executeQuery("PRAGMA journal_mode")) {
+                            if (!mode.next() || !"wal".equalsIgnoreCase(mode.getString(1))) {
+                                throw new SQLException("SQLite must use WAL mode (initialize database first)");
+                            }
+                        }
+                    }
+                }
+                // Validate the complete schema on every new/recovered connection.
+                try (Statement stmt = opened.createStatement()) {
+                    for (String table : new String[] {"users", "sessions", "hnpairs", "motd"}) {
+                        try (ResultSet ignored = stmt.executeQuery("SELECT * FROM " + table + " LIMIT 0")) {
+                            // A missing table fails fast rather than silently creating a partial DB.
+                        }
+                    }
+                }
+                return opened;
+            } catch (SQLException | RuntimeException failure) {
+                opened.close();
+                throw failure;
+            }
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Could not open or validate " + (sqlite ? "SQLite" : "MySQL") + " database", failure);
+        }
+    }
+
     private void testConnection() {
-        PreparedStatement pst = null;
         try {
-            pst = (PreparedStatement) con.prepareStatement("select 1;");
-            pst.executeQuery();
-        } catch (SQLException ex) {
-            try {
-                if (pst != null) {
-                    pst.close();
+            if (con != null && !con.isClosed()) {
+                try (Statement stmt = con.createStatement();
+                     ResultSet ignored = stmt.executeQuery("SELECT 1")) {
+                    return;
                 }
-                if (con != null) {
-                    con.close();
-                }            
-            } catch (SQLException e) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, e);
             }
-            // create a new connection
-            try {
-                this.con = (Connection) DriverManager.getConnection(url, user, password);
-            } catch (SQLException ex1) {
-                Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex1);
-            }
+        } catch (SQLException failure) {
+            // Reopen a broken connection below.
+        }
+        try {
+            if (con != null) con.close();
+        } catch (SQLException ignored) {
+        }
+        con = openConnection();
+    }
+
+    @FunctionalInterface
+    private interface Binder {
+        void bind(PreparedStatement stmt) throws SQLException;
+    }
+
+    private PreparedStatement prepare(String sql, Binder bind) throws SQLException {
+        testConnection();
+        PreparedStatement stmt = con.prepareStatement(sql);
+        try {
+            bind.bind(stmt);
+            return stmt;
+        } catch (SQLException | RuntimeException failure) {
+            stmt.close();
+            throw failure;
         }
     }
 
-    
-    // get userid of an existing session
+    private void execute(String sql, Binder bind) {
+        try (PreparedStatement stmt = prepare(sql, bind)) {
+            stmt.executeUpdate();
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Database update failed", failure);
+        }
+    }
+
     public String getUserid(String sessid) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        // check it out ;-)
-        this.testConnection();
-        
-        String retval = "";
-        try {
-            pst = (PreparedStatement) con.prepareStatement(String.format("select userid from sessions where sessid='%s' and gameid='%s'", sessid, ServerMain.GAMEID));
-            rs = pst.executeQuery();
-            if(rs.next()){
-                retval = rs.getString("userid");            
-            }
-            
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
+        try (PreparedStatement stmt = prepare(
+                "SELECT userid FROM sessions WHERE sessid=? AND gameid=?",
+                q -> { q.setString(1, sessid); q.setString(2, ServerMain.GAMEID); });
+             ResultSet rs = stmt.executeQuery()) {
+            return rs.next() ? rs.getString(1) : "";
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Session lookup failed", failure);
         }
-        
-        return retval;
     }
-    
 
-    // get handle/nickname list for a given userid
     public HNPairs getHNPairs(String userid) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        HNPairs hns = new HNPairs();
-        String nickname;
-        
-        try {
-            pst = (PreparedStatement) con.prepareStatement(String.format("select handle,nickname from hnpairs where userid='%s' limit 0,3", userid));
-            rs = pst.executeQuery();
-            while(rs.next()){
-                hns.add(new HNPair(rs.getString("handle"), rs.getString("nickname")));
+        HNPairs pairs = new HNPairs();
+        try (PreparedStatement stmt = prepare(
+                "SELECT handle,nickname FROM hnpairs WHERE userid=? LIMIT 3",
+                q -> q.setString(1, userid));
+             ResultSet rs = stmt.executeQuery()) {
+            while (rs.next()) {
+                pairs.add(new HNPair(rs.getString(1), rs.getString(2)));
             }
-            
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Handle lookup failed", failure);
         }
-        
-        return hns;
+        return pairs;
     }
 
-    
-    // check if a handles exists
-    // returns true when handle is free
+    /** Returns true when the handle is available. */
     public boolean checkHandle(String handle) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        boolean retval = false;
-        
-        try {
-            pst = (PreparedStatement) con.prepareStatement(String.format("select count(*) as cnt from hnpairs where handle='%s'", handle));
-            rs = pst.executeQuery();
-            if(rs.next()){
-                if(rs.getInt("cnt") == 0) retval=true;
-            }
-            
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
-        }
-        
-        return retval;        
-    }
-
-    
-    // insert a new handle/nickname into database
-    public void createNewHNPair(Client cl) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        try {
-            String nickname;
-            try {
-                nickname = new String(cl.getHNPair().getNickname(),"SJIS");
-            } catch (UnsupportedEncodingException ex) {
-                nickname = "sjis";
-            }
-            pst = (PreparedStatement) con.prepareStatement(String.format("insert into hnpairs (userid,handle,nickname) values ('%s','%s','%s')", 
-                    cl.getUserID(), new String(cl.getHNPair().getHandle()), nickname));
-            pst.executeUpdate();
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
+        try (PreparedStatement stmt = prepare(
+                "SELECT COUNT(*) FROM hnpairs WHERE handle=?",
+                q -> q.setString(1, handle));
+             ResultSet rs = stmt.executeQuery()) {
+            return rs.next() && rs.getInt(1) == 0;
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Handle availability lookup failed", failure);
         }
     }
 
-    
-    // update handle/nickname of a client
-    public void updateHNPair(Client cl) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        String nickname;
-        try {
-            nickname = new String(cl.getHNPair().getNickname(),"SJIS");
-        } catch (UnsupportedEncodingException ex) {
-            nickname = "sjis";
-        }
-
-        try {
-            pst = (PreparedStatement) con.prepareStatement(String.format("update hnpairs set nickname='%s' where userid='%s' and handle='%s'", 
-                    nickname, cl.getUserID(), new String(cl.getHNPair().getHandle())));
-            pst.executeUpdate();
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
-        }        
+    private static String nickname(Client client) {
+        return new String(client.getHNPair().getNickname(), Charset.forName("Shift_JIS"));
     }
- 
 
-    // set area, room, slot for a user
+    private static String handle(Client client) {
+        return new String(client.getHNPair().getHandle(), StandardCharsets.US_ASCII);
+    }
+
+    public void createNewHNPair(Client client) {
+        execute("INSERT INTO hnpairs (userid,handle,nickname) VALUES (?,?,?)",
+                q -> {
+                    q.setString(1, client.getUserID());
+                    q.setString(2, handle(client));
+                    q.setString(3, nickname(client));
+                });
+    }
+
+    public void updateHNPair(Client client) {
+        execute("UPDATE hnpairs SET nickname=? WHERE userid=? AND handle=?",
+                q -> {
+                    q.setString(1, nickname(client));
+                    q.setString(2, client.getUserID());
+                    q.setString(3, handle(client));
+                });
+    }
+
     private void setupDBrestart() {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        try {
-            pst = (PreparedStatement) con.prepareStatement("update sessions set area=-1, room=0, slot=0, gamesess=0, state=0 where gameid=?");
-            pst.setString(1, ServerMain.GAMEID);
-            pst.executeUpdate();
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
-        }
+        execute("UPDATE sessions SET area=-1,room=0,slot=0,gamesess=0,state=0 WHERE gameid=?",
+                q -> q.setString(1, ServerMain.GAMEID));
     }
 
-	
-    // set area, room, slot for a user and a state
     public void updateClientOrigin(String userid, int state, int area, int room, int slot) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        try {
-            pst = (PreparedStatement) con.prepareStatement("update sessions set state=?, area=?, room=?, slot=? where userid=? and gameid=?");
-            pst.setInt(1, state);
-            pst.setInt(2, area);
-            pst.setInt(3, room);
-            pst.setInt(4, slot);
-            pst.setString(5, userid);
-            pst.setString(6, ServerMain.GAMEID);
-            pst.executeUpdate();
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
-        }
+        execute("UPDATE sessions SET state=?,area=?,room=?,slot=? WHERE userid=? AND gameid=?",
+                q -> {
+                    q.setInt(1, state);
+                    q.setInt(2, area);
+                    q.setInt(3, room);
+                    q.setInt(4, slot);
+                    q.setString(5, userid);
+                    q.setString(6, ServerMain.GAMEID);
+                });
     }
 
-	
-    // set game for a user
     public void updateClientGame(String userid, int gamenumber) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        try {
-            String gamenum = (new Integer(gamenumber)).toString();      // TODO: I hate Java for this!
-            pst = (PreparedStatement) con.prepareStatement(String.format("update sessions set gamesess='%s' where userid='%s' and gameid='%s'", gamenum, userid, ServerMain.GAMEID));
-            pst.executeUpdate();
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
-        }
+        execute("UPDATE sessions SET gamesess=? WHERE userid=? AND gameid=?",
+                q -> {
+                    q.setInt(1, gamenumber);
+                    q.setString(2, userid);
+                    q.setString(3, ServerMain.GAMEID);
+                });
     }
 
-
-    // get the gamenumber of a given userid
     public int getGameNumber(String userid) {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        int retval = 0;
-        try {
-            pst = (PreparedStatement) con.prepareStatement(String.format("select gamesess from sessions where userid='%s' and gameid='%s'", userid, ServerMain.GAMEID));
-            rs = pst.executeQuery();
-            if(rs.next()){
-                retval = rs.getInt("gamesess");            
-            }
-            
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
+        try (PreparedStatement stmt = prepare(
+                "SELECT gamesess FROM sessions WHERE userid=? AND gameid=?",
+                q -> {
+                    q.setString(1, userid);
+                    q.setString(2, ServerMain.GAMEID);
+                });
+             ResultSet rs = stmt.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : 0;
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Game lookup failed", failure);
         }
-        
-        return retval;
     }
 
-	
-    // get message of the day
     public String getMOTD() {
-        ResultSet rs = null;
-        PreparedStatement pst = null;
-        // check it out ;-)
-        this.testConnection();
-        
-        String retval = "";
-        try {
-            pst = (PreparedStatement) con.prepareStatement("select message from motd where active=1 order by id desc limit 0,1");
-            rs = pst.executeQuery();
-            if(rs.next()){
-                retval = rs.getString("message");            
-            }
-            
-        } catch (SQLException ex) {
-            Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-        } finally {
-            try {
-                if(rs != null) {
-                    rs.close();
-                }
-                if(pst != null) {
-                    pst.close();
-                }
-            } catch (SQLException ex) {
-                Logger.getLogger(Database.class.getName()).log(Level.WARNING, null, ex);
-            }
+        try (PreparedStatement stmt = prepare(
+                "SELECT message FROM motd WHERE active=1 ORDER BY id DESC LIMIT 1",
+                q -> {});
+             ResultSet rs = stmt.executeQuery()) {
+            return rs.next() ? rs.getString(1) : "";
+        } catch (SQLException failure) {
+            throw new IllegalStateException("MOTD lookup failed", failure);
         }
-        
-        return retval;
     }
 
+    @Override
+    public void close() {
+        try {
+            if (con != null) con.close();
+        } catch (SQLException failure) {
+            throw new IllegalStateException("Database close failed", failure);
+        }
+    }
 }
