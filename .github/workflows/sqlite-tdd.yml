@@ -224,8 +224,8 @@ jobs:
       - name: Compile File 1 and File 2 independently
         run: |
           mkdir -p out/java/bio1 out/java/bio2
-          javac -d out/java/bio1 bioserv1/bioserver/*.java tests/java/DatabaseSmoke.java
-          javac -d out/java/bio2 bioserv2/bioserver/*.java tests/java/DatabaseSmoke.java
+          javac -d out/java/bio1 bioserv1/bioserver/*.java tests/java/DatabaseSmoke.java tests/java/DatabaseLoad.java
+          javac -d out/java/bio2 bioserv2/bioserver/*.java tests/java/DatabaseSmoke.java tests/java/DatabaseLoad.java
       - name: Execute both JDBC implementations on SAME WAL database
         run: |
           for game in bio1 bio2; do
@@ -238,6 +238,19 @@ jobs:
             java -javaagent:/tmp/bio-drivers/jacocoagent.jar=destfile="reports/java-sqlite/$game/jacoco.exec"               -cp "out/java/$game:/tmp/bio-drivers/*" DatabaseSmoke "$id" "$user" "$session"
             java -jar /tmp/bio-drivers/jacococli.jar report "reports/java-sqlite/$game/jacoco.exec"               --classfiles "out/java/$game/bioserver" --sourcefiles "$source"               --xml "reports/java-sqlite/$game/jacoco.xml"
           done
+      - name: Contend Java File1 / Java File2 / PHP writers on the SAME WAL file
+        run: |
+          set -e
+          java -cp "out/java/bio1:/tmp/bio-drivers/*" DatabaseLoad 00000002 fixture_a 180 &
+          j1=$!
+          java -cp "out/java/bio2:/tmp/bio-drivers/*" DatabaseLoad 00000010 fixture_b 180 &
+          j2=$!
+          php tests/migration/ConcurrentPdoWriter.php &
+          php_pid=$!
+          wait "$j1"
+          wait "$j2"
+          wait "$php_pid"
+          python tests/sqlite/concurrency_verify.py
       - name: Reject missing SQLite database at startup
         run: |
           if DB_SQLITE_PATH=/tmp/not-created-bioserver.sqlite             java -cp "out/java/bio1:/tmp/bio-drivers/*" DatabaseSmoke 00000002 fixture_a 87654321; then
