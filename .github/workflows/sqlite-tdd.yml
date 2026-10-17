@@ -1,0 +1,461 @@
+name: BioServer CI and coverage
+on:
+  push:
+    branches: [feature/sqlite-tdd-migration]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  sqlite-contract:
+    name: SQLite contract and Python coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install coverage tooling
+        run: python -m pip install coverage==7.10.7
+      - name: Run SQLite schema and initializer regressions
+        run: |
+          mkdir -p reports/python/sqlite
+          python -m coverage run --source=docker/vars/sqlite -m unittest discover -s tests/sqlite -p 'test_*.py' -v
+          python -m coverage xml -o reports/python/sqlite/coverage.xml
+          python -m coverage report --show-missing
+      - name: Test coverage report aggregator
+        run: python -m unittest discover -s tests/coverage -p 'test_*.py' -v
+      - name: Upload Python coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-python-sqlite
+          path: reports
+          if-no-files-found: warn
+
+  php-regression:
+    name: PHP ${{ matrix.engine }} synthetic DB and coverage
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [sqlite, mysql]
+    services:
+      mysql:
+        image: mysql:9.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bioserver
+          MYSQL_USER: bioserver
+          MYSQL_PASSWORD: bioserver
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      APP_ENV: production
+      FORCE_DEV_LOGIN: 'false'
+      DB_ENGINE: ${{ matrix.engine }}
+      DB_SQLITE_PATH: /tmp/bioserver-ci-php.sqlite
+      DB_USER: bioserver
+      DB_PASSWORD: bioserver
+      DB_HOST: 127.0.0.1
+      DB_DATABASE: bioserver
+      SYNTHETIC_DB_FIXTURE: '1'
+      OPENSSL_CONF: ${{ github.workspace }}/docker/vars/web/openssl.cnf
+      XDEBUG_MODE: coverage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, pdo_mysql, mbstring
+          coverage: xdebug
+          tools: composer:v2
+      - name: Initialize disposable database
+        run: |
+          if [ "$DB_ENGINE" = "sqlite" ]; then
+            python docker/vars/sqlite/init_db.py "$DB_SQLITE_PATH"
+          else
+            docker exec -i -e DB_DATABASE=bioserver "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
+          fi
+      - name: Seed synthetic database twice (idempotency)
+        run: |
+          php web/tests/fixtures/seed_synthetic.php
+          php web/tests/fixtures/seed_synthetic.php
+      - name: Install pinned Composer dependencies
+        working-directory: web
+        run: composer install --no-interaction --prefer-dist
+      - name: Verify DNAS DES-ECB support
+        run: php -r 'if (!in_array("des-ecb", openssl_get_cipher_methods(), true)) { exit(1); }'
+      - name: PHPUnit and PHP source coverage
+        working-directory: web
+        run: |
+          mkdir -p "../reports/php/$DB_ENGINE"
+          vendor/bin/phpunit --testdox \
+            --log-junit "../reports/php/$DB_ENGINE/junit.xml" \
+            --coverage-clover "../reports/php/$DB_ENGINE/clover.xml" \
+            --coverage-cobertura "../reports/php/$DB_ENGINE/cobertura.xml" \
+            --coverage-html "../reports/php/$DB_ENGINE/html"
+      - name: Upload PHP coverage and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-php-${{ matrix.engine }}
+          path: reports
+          if-no-files-found: warn
+
+  java-db-smoke:
+    name: Java File 1/2 JDBC smoke with JaCoCo
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:9.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bioserver
+          MYSQL_USER: bioserver
+          MYSQL_PASSWORD: bioserver
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SYNTHETIC_DB_FIXTURE: '1'
+      DB_ENGINE: mysql
+      DB_USER: bioserver
+      DB_PASSWORD: bioserver
+      DB_HOST: 127.0.0.1
+      DB_DATABASE: bioserver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_mysql
+      - name: Initialize synthetic MySQL
+        run: |
+          docker exec -i -e DB_DATABASE=bioserver "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
+          php web/tests/fixtures/seed_synthetic.php
+      - name: Extract bundled MySQL JDBC driver
+        run: |
+          mkdir -p /tmp/bio-driver
+          dpkg-deb -x docker/deps/mysql-connector-j_8.0.32-1debian11_all.deb /tmp/bio-driver
+          jar="$(find /tmp/bio-driver -name 'mysql-connector-j-*.jar' -type f -print -quit)"
+          test -n "$jar"
+          echo "MYSQL_JDBC_JAR=$jar" >> "$GITHUB_ENV"
+      - name: Compile both independent game server trees
+        run: |
+          mkdir -p out/java/bio1 out/java/bio2
+          javac -d out/java/bio1 bioserv1/bioserver/*.java tests/java/DatabaseSmoke.java
+          javac -d out/java/bio2 bioserv2/bioserver/*.java tests/java/DatabaseSmoke.java
+      - name: Download pinned JaCoCo agent and CLI
+        run: |
+          curl --fail --location --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.agent/0.8.13/org.jacoco.agent-0.8.13-runtime.jar --output /tmp/jacocoagent.jar
+          curl --fail --location --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.cli/0.8.13/org.jacoco.cli-0.8.13-nodeps.jar --output /tmp/jacococli.jar
+      - name: Run both real MySQL JDBC implementations with JaCoCo
+        run: |
+          for game in bio1 bio2; do
+            mkdir -p "reports/java/$game"
+            if [ "$game" = "bio1" ]; then
+              id="00000002"; user="fixture_a"; session="87654321"; source="bioserv1"
+            else
+              id="00000010"; user="fixture_b"; session="87654322"; source="bioserv2"
+            fi
+            java -javaagent:/tmp/jacocoagent.jar=destfile="reports/java/$game/jacoco.exec" \
+              -cp "out/java/$game:$MYSQL_JDBC_JAR" DatabaseSmoke "$id" "$user" "$session"
+            java -jar /tmp/jacococli.jar report "reports/java/$game/jacoco.exec" \
+              --classfiles "out/java/$game/bioserver" \
+              --sourcefiles "$source" \
+              --xml "reports/java/$game/jacoco.xml"
+          done
+      - name: Upload per-game Java coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-java
+          path: reports
+          if-no-files-found: warn
+
+
+  java-sqlite-regression:
+    name: Java File 1/2 real SQLite JDBC with JaCoCo
+    runs-on: ubuntu-latest
+    env:
+      DB_ENGINE: sqlite
+      DB_SQLITE_PATH: /tmp/bioserver-java.sqlite
+      SYNTHETIC_DB_FIXTURE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite
+      - name: Initialize and seed same SQLite database PHP will use
+        run: |
+          python docker/vars/sqlite/init_db.py "$DB_SQLITE_PATH"
+          php web/tests/fixtures/seed_synthetic.php
+      - name: Download pinned JDBC and coverage dependencies
+        run: |
+          mkdir -p /tmp/bio-drivers
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/xerial/sqlite-jdbc/3.53.4.0/sqlite-jdbc-3.53.4.0.jar -o /tmp/bio-drivers/sqlite-jdbc.jar
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar -o /tmp/bio-drivers/slf4j-api.jar
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.agent/0.8.13/org.jacoco.agent-0.8.13-runtime.jar -o /tmp/bio-drivers/jacocoagent.jar
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.cli/0.8.13/org.jacoco.cli-0.8.13-nodeps.jar -o /tmp/bio-drivers/jacococli.jar
+      - name: Compile File 1 and File 2 independently
+        run: |
+          mkdir -p out/java/bio1 out/java/bio2
+          javac -d out/java/bio1 bioserv1/bioserver/*.java tests/java/DatabaseSmoke.java tests/java/DatabaseLoad.java
+          javac -d out/java/bio2 bioserv2/bioserver/*.java tests/java/DatabaseSmoke.java tests/java/DatabaseLoad.java
+      - name: Execute both JDBC implementations on SAME WAL database
+        run: |
+          for game in bio1 bio2; do
+            mkdir -p "reports/java-sqlite/$game"
+            if [ "$game" = bio1 ]; then
+              id="00000002"; user="fixture_a"; session="87654321"; source="bioserv1"
+            else
+              id="00000010"; user="fixture_b"; session="87654322"; source="bioserv2"
+            fi
+            java -javaagent:/tmp/bio-drivers/jacocoagent.jar=destfile="reports/java-sqlite/$game/jacoco.exec"               -cp "out/java/$game:/tmp/bio-drivers/*" DatabaseSmoke "$id" "$user" "$session"
+            java -jar /tmp/bio-drivers/jacococli.jar report "reports/java-sqlite/$game/jacoco.exec"               --classfiles "out/java/$game/bioserver" --sourcefiles "$source"               --xml "reports/java-sqlite/$game/jacoco.xml"
+          done
+      - name: Contend Java File1 / Java File2 / PHP writers on the SAME WAL file
+        run: |
+          set -e
+          java -cp "out/java/bio1:/tmp/bio-drivers/*" DatabaseLoad 00000002 fixture_a 180 &
+          j1=$!
+          java -cp "out/java/bio2:/tmp/bio-drivers/*" DatabaseLoad 00000010 fixture_b 180 &
+          j2=$!
+          php tests/migration/ConcurrentPdoWriter.php &
+          php_pid=$!
+          wait "$j1"
+          wait "$j2"
+          wait "$php_pid"
+          python tests/sqlite/concurrency_verify.py
+      - name: Reject missing SQLite database at startup
+        run: |
+          if DB_SQLITE_PATH=/tmp/not-created-bioserver.sqlite             java -cp "out/java/bio1:/tmp/bio-drivers/*" DatabaseSmoke 00000002 fixture_a 87654321; then
+            echo "Java SQLite startup unexpectedly accepted a missing DB" >&2
+            exit 1
+          fi
+      - name: Upload SQLite Java coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-java-sqlite
+          path: reports
+          if-no-files-found: error
+
+
+  sqlite-import-regression:
+    name: Verified offline MySQL to SQLite import
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:9.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bioserver
+          MYSQL_USER: bioserver
+          MYSQL_PASSWORD: bioserver
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SOURCE_DB_HOST: 127.0.0.1
+      SOURCE_DB_NAME: bioserver
+      SOURCE_DB_USER: bioserver
+      SOURCE_DB_PASSWORD: bioserver
+      DB_HOST: 127.0.0.1
+      DB_DATABASE: bioserver
+      DB_USER: bioserver
+      DB_PASSWORD: bioserver
+      SYNTHETIC_DB_FIXTURE: '1'
+      DB_SQLITE_PATH: /tmp/bioserver-imported.sqlite
+      DB_ENGINE: mysql
+      APP_ENV: production
+      FORCE_DEV_LOGIN: 'false'
+      OPENSSL_CONF: ${{ github.workspace }}/docker/vars/web/openssl.cnf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, pdo_mysql, mbstring
+          tools: composer:v2
+      - name: Set up synthetic source MySQL and empty destination SQLite
+        run: |
+          docker exec -i -e DB_DATABASE=bioserver "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
+          php web/tests/fixtures/seed_synthetic.php
+          python docker/vars/sqlite/init_db.py "$DB_SQLITE_PATH"
+      - name: Preflight, verified import and safety gates
+        run: |
+          mkdir -p reports/migration
+          php tests/migration/mysql_to_sqlite.php --check --sqlite="$DB_SQLITE_PATH" > reports/migration/preflight.json
+          php tests/migration/mysql_to_sqlite.php --apply --ack-offline --ack-collation-change             --sqlite="$DB_SQLITE_PATH" > reports/migration/import.json
+          if php tests/migration/mysql_to_sqlite.php --apply --ack-offline --ack-collation-change --sqlite="$DB_SQLITE_PATH"; then
+            echo "Unsafe repeated import succeeded!" >&2
+            exit 1
+          fi
+          if php tests/migration/mysql_to_sqlite.php --apply --sqlite="$DB_SQLITE_PATH"; then
+            echo "Import succeeded without acknowledgements!" >&2
+            exit 1
+          fi
+      - name: Run full PHP tests on migrated data
+        env:
+          DB_ENGINE: sqlite
+        run: |
+          cd web
+          composer install --no-interaction --prefer-dist
+          composer test
+      - name: Reject MySQL session duplicates in preflight
+        run: |
+          php -r '$db=new PDO("mysql:host=127.0.0.1;dbname=bioserver;charset=utf8mb4","bioserver","bioserver"); $db->exec("INSERT INTO sessions (userid,ip,port,sessid,gameid) SELECT userid,ip,port,sessid,gameid FROM sessions WHERE sessid=\x2787654321\x27 AND gameid=\x2700000002\x27 LIMIT 1");'
+          if php tests/migration/mysql_to_sqlite.php --check --sqlite="$DB_SQLITE_PATH"; then
+            echo "Duplicate-session source passed migration preflight!" >&2
+            exit 1
+          fi
+      - name: Upload migration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-sqlite-migration-evidence
+          path: reports/migration
+          if-no-files-found: warn
+
+  sqlite-docker-smoke:
+    name: Build and boot real SQLite Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare nonproduction Docker settings
+        run: |
+          cp .env.example .env
+          sed -i 's/^SERVER_IP=$/SERVER_IP=127.0.0.1/' .env
+          sed -i 's/^ROUTER_IP=$/ROUTER_IP=127.0.0.1/' .env
+          cat >> .env <<'EOF'
+          SOURCE_DB_HOST=biomysql
+          SOURCE_DB_NAME=bioserver
+          SOURCE_DB_USER=bioserver
+          SOURCE_DB_PASSWORD=bioserver
+          EOF
+      - name: Compose config must not start MySQL
+        run: |
+          docker compose --project-directory . -f docker/sqlite/compose.yaml config --quiet
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration config --quiet
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration config --services | grep -q biosqlite-import
+          if docker compose --project-directory . -f docker/sqlite/compose.yaml config --services | grep -q biomysql; then
+            echo "MySQL accidentally included in SQLite deployment" >&2
+            exit 1
+          fi
+      - name: Build both Java servers and production PHP image
+        run: |
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration build biofpm bio1server bio2server biosqlite-import
+      - name: Seed real MySQL and import through the opt-in container into the volume
+        run: |
+          set -e
+          docker compose --project-directory . -f docker/sqlite/compose.yaml up -d biofpm
+          docker run -d --name biomysql --network bio-network \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=bioserver \
+            -e MYSQL_USER=bioserver -e MYSQL_PASSWORD=bioserver \
+            -e DB_DATABASE=bioserver \
+            -v "$PWD/docker/vars/mysql/2_init_db.sh:/docker-entrypoint-initdb.d/2_init_db.sh:ro" \
+            mysql:9.0
+          for attempt in $(seq 1 45); do
+            if docker exec biomysql mysql -ubioserver -pbioserver bioserver -Nse "SELECT COUNT(*) FROM users" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec -i biomysql mysql --default-character-set=utf8mb4 -ubioserver -pbioserver bioserver <<'EOSQL'
+          INSERT INTO users(userid,passwd) VALUES('ci_player','Secretpass9');
+          INSERT INTO sessions(userid,ip,port,sessid,gameid) VALUES('ci_player','127.0.0.1',6021,'77889900','00000002');
+          INSERT INTO hnpairs(userid,handle,nickname) VALUES('ci_player','A2B3C4','勇気');
+          INSERT INTO motd(id,message,active) VALUES(42,'SQLite volume imported',1);
+          EOSQL
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration run --rm \
+            biosqlite-import --check --sqlite=/var/lib/bioserver/bioserver.sqlite
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration run --rm \
+            biosqlite-import --apply --ack-offline --ack-collation-change --sqlite=/var/lib/bioserver/bioserver.sqlite
+          docker compose --project-directory . -f docker/sqlite/compose.yaml exec -T biofpm \
+            php -r '$db=new PDO("sqlite:/var/lib/bioserver/bioserver.sqlite"); if($db->query("SELECT COUNT(*) FROM users")->fetchColumn()!=1)exit(1);'
+          docker rm -f biomysql
+      - name: Boot PHP and two Java processes on shared SQLite WAL volume
+        run: |
+          docker compose --project-directory . -f docker/sqlite/compose.yaml up -d biosqlite-init biofpm bio1server bio2server
+          sleep 8
+          docker compose --project-directory . -f docker/sqlite/compose.yaml ps
+          for service in biofpm bio1server bio2server; do
+            container="$(docker compose --project-directory . -f docker/sqlite/compose.yaml ps -q "$service")"
+            test -n "$container"
+            test "$(docker inspect -f '{{.State.Running}}' "$container")" = true
+          done
+          docker compose --project-directory . -f docker/sqlite/compose.yaml exec -T biofpm             php -r '$db=new PDO("sqlite:/var/lib/bioserver/bioserver.sqlite"); $result=$db->query("PRAGMA journal_mode")->fetchColumn(); if ($result !== "wal") exit(1);'
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose --project-directory . -f docker/sqlite/compose.yaml logs --no-color
+      - name: Shut down test containers
+        if: always()
+        run: |
+          docker rm -f biomysql >/dev/null 2>&1 || true
+          docker compose --project-directory . -f docker/sqlite/compose.yaml down -v --remove-orphans
+
+  coverage-report:
+    name: Aggregate coverage by component
+    if: always()
+    needs: [sqlite-contract, php-regression, java-db-smoke, java-sqlite-regression]
+    runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-input
+          merge-multiple: true
+      - name: Generate separated coverage summary
+        run: |
+          python tests/coverage/aggregate.py --require coverage-input | tee coverage-summary.md
+          cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive aggregated reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-combined-reports
+          path: |
+            coverage-summary.md
+            coverage-input
+          if-no-files-found: warn
+      - name: Optional Codecov upload (requires CODECOV_TOKEN)
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: coverage-input/php/sqlite/cobertura.xml,coverage-input/php/mysql/cobertura.xml,coverage-input/python/sqlite/coverage.xml,coverage-input/java/bio1/jacoco.xml,coverage-input/java/bio2/jacoco.xml,coverage-input/java-sqlite/bio1/jacoco.xml,coverage-input/java-sqlite/bio2/jacoco.xml
+          flags: bioserver-ci
+          fail_ci_if_error: false

@@ -52,3 +52,17 @@ enable-systemd-resolved:
 	sudo mv /etc/.resolv.conf /etc/resolv.conf
 	sudo systemctl enable systemd-resolved
 	sudo systemctl start systemd-resolved
+# Explicit SQLite mode; intentionally outside the normal Compose file glob.
+SQLITE_COMPOSE := --project-directory . -f docker/sqlite/compose.yaml
+
+sqlite-build:
+	${DOCKER_BIN} compose ${SQLITE_COMPOSE} build
+
+sqlite-run:
+	${DOCKER_BIN} compose ${SQLITE_COMPOSE} up -d
+
+sqlite-down:
+	${DOCKER_BIN} compose ${SQLITE_COMPOSE} down
+
+sqlite-config:
+	${DOCKER_BIN} compose ${SQLITE_COMPOSE} config

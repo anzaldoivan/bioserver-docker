@@ -42,6 +42,6 @@ enum EnvironmentType: string
      */
     public static function get(): self
     {
-        return self::from((string) $_ENV["APP_ENV"]);
+        return self::from((string) ($_ENV["APP_ENV"] ?? getenv("APP_ENV") ?: "production"));
     }
 }

@@ -1,8 +1,8 @@
 FROM php:8.3-fpm AS base
 
-RUN docker-php-ext-install pdo pdo_mysql mysqli && \
+RUN apt-get update && apt-get install -y --no-install-recommends unzip libsqlite3-dev pkg-config && \
+    docker-php-ext-install pdo pdo_mysql pdo_sqlite mysqli && \
     docker-php-ext-enable mysqli && \
-    apt-get update && apt-get install -y --no-install-recommends unzip && \
     mkdir /home/www-data && \
     chmod 755 /home/www-data && \
     chown -R www-data:www-data /home/www-data && \

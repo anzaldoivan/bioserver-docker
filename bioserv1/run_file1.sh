@@ -8,4 +8,4 @@ if [ -e ./bioserver/patch.raw ]
         echo 'patch.raw not found'
 fi
 
-java -cp lib/mysql-connector.jar:bin bioserver.ServerMain
+java -cp "lib/*:bin" bioserver.ServerMain

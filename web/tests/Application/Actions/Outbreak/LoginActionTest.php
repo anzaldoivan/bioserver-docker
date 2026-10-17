@@ -11,7 +11,7 @@ use App\Domain\Outbreak\PasswordValidatorInterface;
 use App\Domain\Outbreak\UserNameValidatorInterface;
 use App\Domain\Outbreak\ValueObjects\Password;
 use App\Domain\Outbreak\ValueObjects\UserName;
-use mysqli;
+use PDO;
 use Psr\Http\Message\ResponseInterface;
 use Tests\Application\Actions\Outbreak\Traits\HasGameIDDataProvider;
 use Tests\TestCase;
@@ -24,8 +24,8 @@ class LoginActionTest extends TestCase
     {
         $app = self::getApp();
 
-        /**@var mysqli $mysql */
-        $mysql = $app->getContainer()->get(mysqli::class);
+        /**@var PDO $mysql */
+        $mysql = $app->getContainer()->get(PDO::class);
         /**@var PasswordValidatorInterface $passwordValidator */
         $passwordValidator = $app->getContainer()->get(PasswordValidatorInterface::class);
         /**@var UserNameValidatorInterface $usernameValidator */
@@ -210,8 +210,10 @@ class LoginActionTest extends TestCase
         );
 
         /**@var mysqli $mysql */
-        $mysql = self::getApp()->getContainer()->get(mysqli::class);
-        $sessions = $mysql->execute_query("select * from sessions where userid = ?", [$username])->fetch_all(MYSQLI_ASSOC);
+        $mysql = self::getApp()->getContainer()->get(PDO::class);
+        $stmt = $mysql->prepare("SELECT * FROM sessions WHERE userid=?");
+        $stmt->execute([$username]);
+        $sessions = $stmt->fetchAll(PDO::FETCH_ASSOC);
         $sessid = $sessions[0]["sessid"];
 
         $this->assertEquals(1, count($sessions));

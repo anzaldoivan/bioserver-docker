@@ -1,6 +1,7 @@
-<phpunit
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:noNamespaceSchemaLocation="http://schema.phpunit.de/7.1/phpunit.xsd"
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/9.6/phpunit.xsd"
+    bootstrap="tests/bootstrap.php"
     backupGlobals="false"
     backupStaticAttributes="false"
     beStrictAboutTestsThatDoNotTestAnything="true"
@@ -11,9 +12,7 @@
     convertNoticesToExceptions="true"
     convertWarningsToExceptions="true"
     processIsolation="false"
-    stopOnFailure="false"
-    bootstrap="tests/bootstrap.php"
->
+    stopOnFailure="false">
     <php>
         <env name="APP_ENV" value="production" force="true"/>
         <env name="FORCE_DEV_LOGIN" value="false" force="true"/>
@@ -23,9 +22,10 @@
             <directory>./tests/</directory>
         </testsuite>
     </testsuites>
-    <filter>
-        <whitelist processUncoveredFilesFromWhitelist="true">
+    <coverage processUncoveredFiles="true">
+        <include>
             <directory suffix=".php">./src/</directory>
-        </whitelist>
-    </filter>
+            <directory suffix=".php">./app/</directory>
+        </include>
+    </coverage>
 </phpunit>

@@ -15,24 +15,31 @@ class EnvSettings implements SettingsInterface
     public function __construct()
     {
         $production = EnvironmentType::isProduction();
+        // CLI PHP can omit environment variables from $_ENV (variables_order=GPCS).
+        $env = static function (string $name, ?string $default = null): ?string {
+            $value = $_ENV[$name] ?? getenv($name);
+            return $value === false ? $default : $value;
+        };
 
         $this->settings = [
             "version"             => "2.4.0",
             "production"          => $production,
-            "force_dev_login"     => filter_var($_ENV["FORCE_DEV_LOGIN"] ?? false, FILTER_VALIDATE_BOOL),
+            "force_dev_login"     => filter_var($env("FORCE_DEV_LOGIN", "false"), FILTER_VALIDATE_BOOL),
             "displayErrorDetails" => ! $production,
-            "logError"            => filter_var($_ENV["LOG_ERROR"] ?? false, FILTER_VALIDATE_BOOL),
-            "logErrorDetails"     => filter_var($_ENV["LOG_ERROR_DETAILS"] ?? false, FILTER_VALIDATE_BOOL),
+            "logError"            => filter_var($env("LOG_ERROR", "false"), FILTER_VALIDATE_BOOL),
+            "logErrorDetails"     => filter_var($env("LOG_ERROR_DETAILS", "false"), FILTER_VALIDATE_BOOL),
             "logger" => [
                 "name"  => "bioserver-web-ui",
                 "path"  => "php://stdout",
-                "level" => $_ENV["LOG_LEVEL"] ?? Logger::DEBUG
+                "level" => $env("LOG_LEVEL", (string) Logger::DEBUG)
             ],
             "db" => [
-                "host"     => $_ENV["DB_HOST"],
-                "database" => $_ENV["DB_DATABASE"],
-                "user"     => $_ENV["DB_USER"],
-                "password" => $_ENV["DB_PASSWORD"]
+                "engine" => $env("DB_ENGINE", "mysql"),
+                "sqlite_path" => $env("DB_SQLITE_PATH", "/var/lib/bioserver/bioserver.sqlite"),
+                "host" => $env("DB_HOST", "biomysql"),
+                "database" => $env("DB_DATABASE", "bioserver"),
+                "user" => $env("DB_USER", "bioserver"),
+                "password" => $env("DB_PASSWORD", "")
             ]
         ];
     }
