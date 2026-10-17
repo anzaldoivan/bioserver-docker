@@ -1,61 +1,48 @@
-name: SQLite TDD
+name: BioServer CI and coverage
 on:
   push:
     branches: [feature/sqlite-tdd-migration]
   pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   sqlite-contract:
+    name: SQLite contract and Python coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m unittest discover -s tests/sqlite -p 'test_*.py' -v
-  java-compile:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Install coverage tooling
+        run: python -m pip install coverage==7.10.7
+      - name: Run SQLite schema and initializer regressions
+        run: |
+          mkdir -p reports/python/sqlite
+          python -m coverage run --source=docker/vars/sqlite -m unittest discover -s tests/sqlite -p 'test_*.py' -v
+          python -m coverage xml -o reports/python/sqlite/coverage.xml
+          python -m coverage report --show-missing
+      - name: Test coverage report aggregator
+        run: python -m unittest discover -s tests/coverage -p 'test_*.py' -v
+      - name: Upload Python coverage
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          distribution: temurin
-          java-version: '17'
-      - run: |
-          mkdir -p /tmp/bio1 /tmp/bio2
-          javac -d /tmp/bio1 bioserv1/bioserver/*.java
-          javac -d /tmp/bio2 bioserv2/bioserver/*.java
-  php-regression:
-    runs-on: ubuntu-latest
-    env:
-      APP_ENV: production
-      FORCE_DEV_LOGIN: 'false'
-      DB_ENGINE: sqlite
-      DB_SQLITE_PATH: /tmp/bioserver-test.sqlite
-      DB_USER: bioserver
-      DB_PASSWORD: bioserver
-      DB_HOST: biomysql
-      DB_DATABASE: bioserver
-      OPENSSL_CONF: ${{ github.workspace }}/docker/vars/web/openssl.cnf
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.3'
-          extensions: pdo_sqlite, pdo_mysql, mbstring
-          tools: composer:v2
-      - run: python docker/vars/sqlite/init_db.py /tmp/bioserver-test.sqlite
-      - working-directory: web
-        run: composer install --no-interaction --prefer-dist
-      - name: Verify legacy DES is enabled for DNAS packets
-        run: php -r 'if (!in_array("des-ecb", openssl_get_cipher_methods(), true)) { fwrite(STDERR, "DES-ECB unavailable; check OPENSSL_CONF legacy provider\n"); exit(1); }'
-      - working-directory: web
-        run: composer test
+          name: coverage-python-sqlite
+          path: reports/python/sqlite
+          if-no-files-found: warn
 
-  php-mysql-regression:
+  php-regression:
+    name: PHP ${{ matrix.engine }} synthetic DB and coverage
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [sqlite, mysql]
     services:
       mysql:
         image: mysql:9.0
@@ -72,27 +59,168 @@ jobs:
     env:
       APP_ENV: production
       FORCE_DEV_LOGIN: 'false'
+      DB_ENGINE: ${{ matrix.engine }}
+      DB_SQLITE_PATH: /tmp/bioserver-ci-php.sqlite
+      DB_USER: bioserver
+      DB_PASSWORD: bioserver
+      DB_HOST: 127.0.0.1
+      DB_DATABASE: bioserver
+      SYNTHETIC_DB_FIXTURE: '1'
+      OPENSSL_CONF: ${{ github.workspace }}/docker/vars/web/openssl.cnf
+      XDEBUG_MODE: coverage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, pdo_mysql, mbstring
+          coverage: xdebug
+          tools: composer:v2
+      - name: Initialize disposable database
+        run: |
+          if [ "$DB_ENGINE" = "sqlite" ]; then
+            python docker/vars/sqlite/init_db.py "$DB_SQLITE_PATH"
+          else
+            docker exec -i -e DB_DATABASE=bioserver "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
+          fi
+      - name: Seed synthetic database twice (idempotency)
+        run: |
+          php web/tests/fixtures/seed_synthetic.php
+          php web/tests/fixtures/seed_synthetic.php
+      - name: Install pinned Composer dependencies
+        working-directory: web
+        run: composer install --no-interaction --prefer-dist
+      - name: Verify DNAS DES-ECB support
+        run: php -r 'if (!in_array("des-ecb", openssl_get_cipher_methods(), true)) { exit(1); }'
+      - name: PHPUnit and PHP source coverage
+        working-directory: web
+        run: |
+          mkdir -p "../reports/php/$DB_ENGINE"
+          vendor/bin/phpunit --testdox \
+            --log-junit "../reports/php/$DB_ENGINE/junit.xml" \
+            --coverage-clover "../reports/php/$DB_ENGINE/clover.xml" \
+            --coverage-cobertura "../reports/php/$DB_ENGINE/cobertura.xml" \
+            --coverage-html "../reports/php/$DB_ENGINE/html"
+      - name: Upload PHP coverage and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-php-${{ matrix.engine }}
+          path: reports/php/${{ matrix.engine }}
+          if-no-files-found: warn
+
+  java-db-smoke:
+    name: Java File 1/2 JDBC smoke with JaCoCo
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:9.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bioserver
+          MYSQL_USER: bioserver
+          MYSQL_PASSWORD: bioserver
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SYNTHETIC_DB_FIXTURE: '1'
       DB_ENGINE: mysql
       DB_USER: bioserver
       DB_PASSWORD: bioserver
       DB_HOST: 127.0.0.1
       DB_DATABASE: bioserver
-      OPENSSL_CONF: ${{ github.workspace }}/docker/vars/web/openssl.cnf
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
-          extensions: pdo_mysql, mbstring
-          tools: composer:v2
-      - name: Initialize real MySQL schema
+          extensions: pdo_mysql
+      - name: Initialize synthetic MySQL
         run: |
           docker exec -i -e DB_DATABASE=bioserver "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
-      - name: Install PHP dependencies
-        working-directory: web
-        run: composer install --no-interaction --prefer-dist
-      - name: Verify legacy DNAS cipher
-        run: php -r 'if (!in_array("des-ecb", openssl_get_cipher_methods(), true)) { exit(1); }'
-      - name: Run MySQL PHP regressions
-        working-directory: web
-        run: composer test
+          php web/tests/fixtures/seed_synthetic.php
+      - name: Extract bundled MySQL JDBC driver
+        run: |
+          mkdir -p /tmp/bio-driver
+          dpkg-deb -x docker/deps/mysql-connector-j_8.0.32-1debian11_all.deb /tmp/bio-driver
+          jar="$(find /tmp/bio-driver -name 'mysql-connector-j-*.jar' -type f -print -quit)"
+          test -n "$jar"
+          echo "MYSQL_JDBC_JAR=$jar" >> "$GITHUB_ENV"
+      - name: Compile both independent game server trees
+        run: |
+          mkdir -p out/java/bio1 out/java/bio2
+          javac -d out/java/bio1 bioserv1/bioserver/*.java tests/java/DatabaseSmoke.java
+          javac -d out/java/bio2 bioserv2/bioserver/*.java tests/java/DatabaseSmoke.java
+      - name: Download pinned JaCoCo agent and CLI
+        run: |
+          curl --fail --location --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.agent/0.8.13/org.jacoco.agent-0.8.13-runtime.jar --output /tmp/jacocoagent.jar
+          curl --fail --location --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.cli/0.8.13/org.jacoco.cli-0.8.13-nodeps.jar --output /tmp/jacococli.jar
+      - name: Run both real MySQL JDBC implementations with JaCoCo
+        run: |
+          for game in bio1 bio2; do
+            mkdir -p "reports/java/$game"
+            if [ "$game" = "bio1" ]; then
+              id="00000002"; user="fixture_a"; session="87654321"; source="bioserv1"
+            else
+              id="00000010"; user="fixture_b"; session="87654322"; source="bioserv2"
+            fi
+            java -javaagent:/tmp/jacocoagent.jar=destfile="reports/java/$game/jacoco.exec" \
+              -cp "out/java/$game:$MYSQL_JDBC_JAR" DatabaseSmoke "$id" "$user" "$session"
+            java -jar /tmp/jacococli.jar report "reports/java/$game/jacoco.exec" \
+              --classfiles "out/java/$game/bioserver" \
+              --sourcefiles "$source" \
+              --xml "reports/java/$game/jacoco.xml"
+          done
+      - name: Upload per-game Java coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-java
+          path: reports/java
+          if-no-files-found: warn
+
+  coverage-report:
+    name: Aggregate coverage by component
+    if: always()
+    needs: [sqlite-contract, php-regression, java-db-smoke]
+    runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-input
+          merge-multiple: true
+      - name: Generate separated coverage summary
+        run: |
+          python tests/coverage/aggregate.py coverage-input | tee coverage-summary.md
+          cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive aggregated reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-combined-reports
+          path: |
+            coverage-summary.md
+            coverage-input
+          if-no-files-found: warn
+      - name: Optional Codecov upload (requires CODECOV_TOKEN)
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: coverage-input/reports/php/sqlite/cobertura.xml,coverage-input/reports/php/mysql/cobertura.xml,coverage-input/reports/python/sqlite/coverage.xml,coverage-input/reports/java/bio1/jacoco.xml,coverage-input/reports/java/bio2/jacoco.xml
+          flags: bioserver-ci
+          fail_ci_if_error: false
