@@ -82,20 +82,23 @@ public class ServerStreamBuffer {
     // return a buffer with complete messages (gameserver)
     public byte[] getCompleteGameMessages() {
         byte[] b = buf.array();
-        // is it a gameplay packet to check, or a lobby packet ?
-        // for simplicity we assume that session packet is always complete!
-        if((b[0]==(byte)0x82) && (b[1]==0x02)) {
-            byte[] retval = new byte[buf.position()];
-            buf.rewind();
-            buf.get(retval);
-            this.buf.clear();
-            return retval;
-        }
-        
-        int size = this.buf.position()-this.messptr;
+        int size = this.buf.position() - this.messptr;
+        if (size <= 0) return null;
         int total = 0;
         int plen;
-        
+
+        // GSLOGIN looks like 0x82 0x02 0x10 0x31 with a 10-byte payload.
+        // Gameplay packets are one-byte LENGTH-prefixed, not a control opcode.
+        // Wait for an incomplete login prefix instead of dropping its fragments.
+        if (GameServerFrame.mightBeLogin(b, this.messptr, size)) {
+            if (!GameServerFrame.isCompleteLogin(b, this.messptr, size)) return null;
+            byte[] retval = new byte[size];
+            System.arraycopy(b, this.messptr, retval, 0, size);
+            this.messptr = 0;
+            buf.clear();
+            return retval;
+        }
+
         // enough data for a complete message? at least 2 bytes needed!
         if(size >= 1) {
             // determine size of complete messages

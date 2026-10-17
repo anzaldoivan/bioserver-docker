@@ -1,0 +1,28 @@
+name: Game relay regression
+on:
+  push:
+    branches: [fix/gameplay-frame-relay-0x82]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  game-relay:
+    name: Game relay and TCP framing (both games)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        game: [bioserv1, bioserv2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Compile game server with regression harness
+        run: |
+          mkdir -p "out/${{ matrix.game }}"
+          javac -d "out/${{ matrix.game }}" "${{ matrix.game }}/bioserver/"*.java tests/java/GameRelayRegressionTest.java
+      - name: Run socketless game packet relay and stream tests
+        run: java -cp "out/${{ matrix.game }}" bioserver.GameRelayRegressionTest
