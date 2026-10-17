@@ -31,7 +31,7 @@ class EnvSettings implements SettingsInterface
             "logger" => [
                 "name"  => "bioserver-web-ui",
                 "path"  => "php://stdout",
-                "level" => $env("LOG_LEVEL", Logger::DEBUG)
+                "level" => $env("LOG_LEVEL", (string) Logger::DEBUG)
             ],
             "db" => [
                 "engine" => $env("DB_ENGINE", "mysql"),
