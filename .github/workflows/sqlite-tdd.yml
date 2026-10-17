@@ -87,7 +87,7 @@ jobs:
           tools: composer:v2
       - name: Initialize real MySQL schema
         run: |
-          docker exec -i "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
+          docker exec -i -e DB_DATABASE=bioserver "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
       - name: Install PHP dependencies
         working-directory: web
         run: composer install --no-interaction --prefer-dist
