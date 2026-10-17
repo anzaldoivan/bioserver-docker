@@ -48,6 +48,14 @@ To keep your existing MySQL data when upgrading to `2.4` (without dump migration
 
 The MySQL files will be stored in `./dbdata` on the host, so database content is preserved across updates and image changes.
 
+## Experimental SQLite backend (draft PR only)
+
+MySQL remains the default. To build SQLite explicitly, run `make sqlite-build`, followed by `make sqlite-run`. To stop it without deleting its persistent volume, run `make sqlite-down`. The SQLite deployment uses `docker/sqlite/compose.yaml` (not included by the regular Makefile glob), one named local volume, a schema initialization job, and PHP + both Java servers sharing WAL mode.
+
+For moving existing data, **do not just switch the environment variable**: follow [the verified import and rollback procedure](docs/sqlite-import.md) and use the opt-in `biosqlite-import` profile. MySQL passwords use different case-comparison semantics, so explicit migration acknowledgment is required. Keep the old MySQL volume backed up.
+
+Before treating this backend as production-ready, run actual game-client File #1/File #2 acceptance tests, restore-from-backup rehearsal and host-specific volume permissions checks.
+
 ## Gateway certificates
 
 The gateway uses a local CA and one SAN server certificate for all DNAS hostnames.

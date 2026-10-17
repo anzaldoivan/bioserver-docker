@@ -20,3 +20,18 @@ The importer reads a consistent MySQL snapshot (REPEATABLE READ + READ ONLY, UTC
 Keep the old MySQL volume offline and intact. To revert, stop all SQLite game/PHP writers and restore the original MySQL Compose mode and the backed-up MySQL data. Data created **after** switching to SQLite will not automatically replicate back to MySQL; do not promise lossless rollback without an explicit reverse migration.
 
 Use the opt-in Compose mode: `make sqlite-build`, `make sqlite-run`, and `make sqlite-down`. SQLite's journal/WAL files and main DB all reside on the same Docker local volume, owned by UID/GID 33 for PHP FPM. Never put the SQLite volume on NFS/SMB or a shared multi-host filesystem.
+
+## Importing directly into the persistent Docker volume
+
+The SQLite deployment includes the opt-in `biosqlite-import` service under the `migration` profile. This uses the production PHP image with both PDO drivers and mounts **the same persistent SQLite volume** as the game servers. The migration entrypoint is not started during ordinary `make sqlite-run`.
+
+1. Stop the original PHP and both Java game writers while keeping the **backed-up** MySQL database service online on the same `bio-network`.
+2. Set SOURCE_DB_HOST=biomysql, SOURCE_DB_NAME, SOURCE_DB_USER and SOURCE_DB_PASSWORD in `.env` for a **read-only** MySQL account. Keep file permissions restrictive.
+3. Run `docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration build biosqlite-import`.
+4. Run `docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration run --rm biosqlite-import --check --sqlite=/var/lib/bioserver/bioserver.sqlite`.
+5. After resolving preflight errors, run `docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration run --rm biosqlite-import --apply --ack-offline --ack-collation-change --sqlite=/var/lib/bioserver/bioserver.sqlite`.
+6. Stop the MySQL server service, then start the SQLite deployment using `make sqlite-run`. Verify logins and sessions from actual File #1 and File #2 clients before public access.
+
+The importer *refuses a populated SQLite database*, so you must use a fresh SQLite volume for a new import. Do not remove volumes containing player data; make a separate verified backup first. The original MySQL data volume remains unchanged by the importer. Retain it as rollback source.
+
+**The importer is one-way.** Any registrations, sessions or nicknames created after moving to SQLite are not backported automatically to MySQL.
