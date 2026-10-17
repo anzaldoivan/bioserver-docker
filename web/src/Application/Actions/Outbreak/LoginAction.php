@@ -18,7 +18,7 @@ use DomainException;
 use Exception;
 use InvalidArgumentException;
 use Monolog\Logger;
-use mysqli;
+use PDO;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Log\LoggerInterface;
 use Slim\Views\Twig;
@@ -30,7 +30,7 @@ final class LoginAction extends Action
 
     public function __construct(
         LoggerInterface $logger,
-        private mysqli $mysql,
+        private PDO $db,
         private UserNameValidatorInterface $usernameValidator,
         private PasswordValidatorInterface $passwordValidator
     ) {
@@ -82,24 +82,36 @@ final class LoginAction extends Action
                 ["ip" => $ip]
             );
 
-            //drop session for both games
-            $stmnt = $this->mysql->prepare("delete from sessions where userid = ?");
-            $stmnt->bind_param("s", $userid);
-            $res = $stmnt->execute();
-
-            if (! $res) {
-                throw new DomainException("Session creation failed.");
+            // Keep delete + create atomic, including inside PHPUnit transactions.
+            $nested = $this->db->inTransaction();
+            if ($nested) {
+                $this->db->exec("SAVEPOINT bioserver_session_replace");
+            } else {
+                $this->db->beginTransaction();
             }
+            try {
+                $stmt = $this->db->prepare("DELETE FROM sessions WHERE userid=?");
+                $stmt->execute([$userid]);
 
-            $sessid = $this->sessionID($gameID);
-            $stmnt = $this->mysql->prepare(
-                "insert into sessions (userid, ip, port, sessid, lastlogin, gameid) values (?, ?, ?, ?, now(), ?)"
-            );
-            $stmnt->bind_param("ssiss", $userid, $ip, $port, $sessid, $gameID);
-            $res = $stmnt->execute();
+                $sessid = $this->sessionID($gameID);
+                $stmt = $this->db->prepare(
+                    "INSERT INTO sessions (userid,ip,port,sessid,lastlogin,gameid) VALUES (?,?,?,?,CURRENT_TIMESTAMP,?)"
+                );
+                $stmt->execute([$userid, $ip, (int) $port, (string) $sessid, $gameID]);
 
-            if (! $res) {
-                throw new DomainException("Session creation failed.");
+                if ($nested) {
+                    $this->db->exec("RELEASE SAVEPOINT bioserver_session_replace");
+                } else {
+                    $this->db->commit();
+                }
+            } catch (\Throwable $e) {
+                if ($nested) {
+                    $this->db->exec("ROLLBACK TO SAVEPOINT bioserver_session_replace");
+                    $this->db->exec("RELEASE SAVEPOINT bioserver_session_replace");
+                } elseif ($this->db->inTransaction()) {
+                    $this->db->rollBack();
+                }
+                throw $e;
             }
 
             $this->logger->info(
@@ -163,31 +175,25 @@ final class LoginAction extends Action
         $action = OutbreakLoginAction::from($action);
 
         return match ($action) {
-            OutbreakLoginAction::NewAccount => new RegisterHandler($this->mysql),
-            OutbreakLoginAction::Manual => new LoginHandler($this->mysql)
+            OutbreakLoginAction::NewAccount => new RegisterHandler($this->db),
+            OutbreakLoginAction::Manual => new LoginHandler($this->db)
         };
     }
 
     private function sessionID(string $gameID): int
     {
-        while (true) {
-            $sessid = mt_rand(10000000, 99999999);
-
-            $res = $this->mysql->query(
-                sprintf(
-                    "select count(*) as cnt from sessions where sessid = %s and gameid = %s",
-                    $sessid,
-                    $gameID
-                )
-            );
-
-            if ($res !== false && $res->num_rows > 0) {
-                $row = $res->fetch_array(MYSQLI_ASSOC);
-
-                if (isset($row["cnt"]) && $row["cnt"] == 0) {
-                    return $sessid;
-                }
+        $stmt = $this->db->prepare(
+            "SELECT COUNT(*) FROM sessions WHERE sessid=? AND gameid=?"
+        );
+        for ($attempt = 0; $attempt < 1000; ++$attempt) {
+            $sessid = random_int(10000000, 99999999);
+            // Game IDs have significant leading zeroes; never compare as numbers.
+            $stmt->execute([(string) $sessid, $gameID]);
+            if ((int) $stmt->fetchColumn() === 0) {
+                return $sessid;
             }
+            $stmt->closeCursor();
         }
+        throw new DomainException("Session identifier allocation failed.");
     }
 }

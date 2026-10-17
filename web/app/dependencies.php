@@ -32,23 +32,29 @@ return function (ContainerBuilder $containerBuilder) {
 
             return $logger;
         },
-        mysqli::class => function (ContainerInterface $c) {
+        PDO::class => function (ContainerInterface $c) {
             $settings = $c->get(SettingsInterface::class);
 
             $db = $settings->get("db");
 
-            $connection = mysqli_connect(
-                $db["host"],
+            $options = [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+            ];
+            if ($db["engine"] === "sqlite") {
+                $connection = new PDO("sqlite:" . $db["sqlite_path"], null, null, $options);
+                $connection->exec("PRAGMA busy_timeout = 10000");
+                return $connection;
+            }
+            if ($db["engine"] !== "mysql") {
+                throw new DomainException("Unsupported database engine: " . $db["engine"]);
+            }
+            return new PDO(
+                "mysql:host=" . $db["host"] . ";dbname=" . $db["database"] . ";charset=utf8mb4",
                 $db["user"],
                 $db["password"],
-                $db["database"]
+                $options
             );
-
-            if (! $connection) {
-                throw new DomainException("Couldn't establish connection to database.");
-            }
-
-            return $connection;
         },
         PasswordValidatorInterface::class => function (ContainerInterface $c) {
             $settings = $c->get(SettingsInterface::class);

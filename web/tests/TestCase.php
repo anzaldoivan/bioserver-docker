@@ -14,7 +14,7 @@ use Slim\Psr7\Factory\StreamFactory;
 use Slim\Psr7\Headers;
 use Slim\Psr7\Request as SlimRequest;
 use Slim\Psr7\Uri;
-use mysqli;
+use PDO;
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
@@ -25,43 +25,33 @@ class TestCase extends PHPUnit_TestCase
 {
     use ProphecyTrait;
 
-    /**
-     * @var mysqli[]
-     */
-    private array $databaseConnections = [];
-
     private static App $app;
 
     protected static function getApp(): App
     {
-        if (empty(self::$app)) {
+        if (! isset(self::$app)) {
             self::$app = (new self())->getAppInstance();
         }
-
         return self::$app;
     }
 
-    /**
-     * Set up test environment - start database transaction
-     */
     protected function setUp(): void
     {
         parent::setUp();
-        $this->databaseConnections = [];
+        $db = self::getApp()->getContainer()->get(PDO::class);
+        if (! $db->inTransaction()) {
+            $db->beginTransaction();
+        }
     }
 
-    /**
-     * Tear down test environment - rollback database transaction
-     */
     protected function tearDown(): void
     {
-        foreach ($this->databaseConnections as $connection) {
-            if ($connection && !$connection->connect_errno) {
-                $connection->rollback();
-                $connection->autocommit(true);
+        if (isset(self::$app)) {
+            $db = self::$app->getContainer()->get(PDO::class);
+            if ($db->inTransaction()) {
+                $db->rollBack();
             }
         }
-        $this->databaseConnections = [];
         parent::tearDown();
     }
 
@@ -99,13 +89,6 @@ class TestCase extends PHPUnit_TestCase
 
         // Add Twig
         $twig = Twig::create(__DIR__ . "/../views", ["cache" => false]);
-
-        // Start database transaction for test isolation
-        $mysql = $container->get(mysqli::class);
-        if ($mysql && !$mysql->connect_errno) {
-            $mysql->autocommit(false);
-            $this->databaseConnections[] = $mysql;
-        }
 
         // Instantiate the app
         AppFactory::setContainer($container);
