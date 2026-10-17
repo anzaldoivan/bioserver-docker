@@ -1,0 +1,52 @@
+name: SQLite TDD
+on:
+  push:
+    branches: [feature/sqlite-tdd-migration]
+  pull_request:
+jobs:
+  sqlite-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests/sqlite -p 'test_*.py' -v
+  java-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: |
+          mkdir -p /tmp/bio1 /tmp/bio2
+          javac -d /tmp/bio1 bioserv1/bioserver/*.java
+          javac -d /tmp/bio2 bioserv2/bioserver/*.java
+  php-regression:
+    runs-on: ubuntu-latest
+    env:
+      APP_ENV: production
+      FORCE_DEV_LOGIN: 'false'
+      DB_ENGINE: sqlite
+      DB_SQLITE_PATH: /tmp/bioserver-test.sqlite
+      DB_USER: bioserver
+      DB_PASSWORD: bioserver
+      DB_HOST: biomysql
+      DB_DATABASE: bioserver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, pdo_mysql, mbstring
+          tools: composer:v2
+      - run: python docker/vars/sqlite/init_db.py /tmp/bioserver-test.sqlite
+      - working-directory: web
+        run: composer install --no-interaction --prefer-dist
+      - working-directory: web
+        run: composer test
