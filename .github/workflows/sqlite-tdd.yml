@@ -357,16 +357,53 @@ jobs:
           cp .env.example .env
           sed -i 's/^SERVER_IP=$/SERVER_IP=127.0.0.1/' .env
           sed -i 's/^ROUTER_IP=$/ROUTER_IP=127.0.0.1/' .env
+          cat >> .env <<'EOF'
+          SOURCE_DB_HOST=biomysql
+          SOURCE_DB_NAME=bioserver
+          SOURCE_DB_USER=bioserver
+          SOURCE_DB_PASSWORD=bioserver
+          EOF
       - name: Compose config must not start MySQL
         run: |
           docker compose --project-directory . -f docker/sqlite/compose.yaml config --quiet
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration config --quiet
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration config --services | grep -q biosqlite-import
           if docker compose --project-directory . -f docker/sqlite/compose.yaml config --services | grep -q biomysql; then
             echo "MySQL accidentally included in SQLite deployment" >&2
             exit 1
           fi
       - name: Build both Java servers and production PHP image
         run: |
-          docker compose --project-directory . -f docker/sqlite/compose.yaml build biofpm bio1server bio2server
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration build biofpm bio1server bio2server biosqlite-import
+      - name: Seed real MySQL and import through the opt-in container into the volume
+        run: |
+          set -e
+          docker compose --project-directory . -f docker/sqlite/compose.yaml up -d biofpm
+          docker run -d --name biomysql --network bio-network \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=bioserver \
+            -e MYSQL_USER=bioserver -e MYSQL_PASSWORD=bioserver \
+            -e DB_DATABASE=bioserver \
+            -v "$PWD/docker/vars/mysql/2_init_db.sh:/docker-entrypoint-initdb.d/2_init_db.sh:ro" \
+            mysql:9.0
+          for attempt in $(seq 1 45); do
+            if docker exec biomysql mysql -ubioserver -pbioserver bioserver -Nse "SELECT COUNT(*) FROM users" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec -i biomysql mysql --default-character-set=utf8mb4 -ubioserver -pbioserver bioserver <<'EOSQL'
+          INSERT INTO users(userid,passwd) VALUES('ci_player','Secretpass9');
+          INSERT INTO sessions(userid,ip,port,sessid,gameid) VALUES('ci_player','127.0.0.1',6021,'77889900','00000002');
+          INSERT INTO hnpairs(userid,handle,nickname) VALUES('ci_player','A2B3C4','勇気');
+          INSERT INTO motd(id,message,active) VALUES(42,'SQLite volume imported',1);
+          EOSQL
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration run --rm \
+            biosqlite-import --check --sqlite=/var/lib/bioserver/bioserver.sqlite
+          docker compose --project-directory . -f docker/sqlite/compose.yaml --profile migration run --rm \
+            biosqlite-import --apply --ack-offline --ack-collation-change --sqlite=/var/lib/bioserver/bioserver.sqlite
+          docker compose --project-directory . -f docker/sqlite/compose.yaml exec -T biofpm \
+            php -r '$db=new PDO("sqlite:/var/lib/bioserver/bioserver.sqlite"); if($db->query("SELECT COUNT(*) FROM users")->fetchColumn()!=1)exit(1);'
+          docker rm -f biomysql
       - name: Boot PHP and two Java processes on shared SQLite WAL volume
         run: |
           docker compose --project-directory . -f docker/sqlite/compose.yaml up -d biosqlite-init biofpm bio1server bio2server
@@ -383,7 +420,9 @@ jobs:
         run: docker compose --project-directory . -f docker/sqlite/compose.yaml logs --no-color
       - name: Shut down test containers
         if: always()
-        run: docker compose --project-directory . -f docker/sqlite/compose.yaml down -v --remove-orphans
+        run: |
+          docker rm -f biomysql >/dev/null 2>&1 || true
+          docker compose --project-directory . -f docker/sqlite/compose.yaml down -v --remove-orphans
 
   coverage-report:
     name: Aggregate coverage by component
