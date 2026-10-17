@@ -1,0 +1,115 @@
+# Opt-in deployment. Select explicitly:
+# docker compose --project-directory . -f docker/sqlite/compose.yaml up -d --build
+# Never matched by the default Makefile docker-compose.*.yaml glob.
+services:
+  biosqlite-init:
+    image: python:3.12-alpine
+    restart: "no"
+    volumes:
+      - sqlite-data:/var/lib/bioserver
+      - ./docker/vars/sqlite:/opt/bioserver-sqlite:ro
+    command:
+      - sh
+      - -ec
+      - |
+        python /opt/bioserver-sqlite/init_db.py /var/lib/bioserver/bioserver.sqlite
+        chown -R 33:33 /var/lib/bioserver
+        chmod 0775 /var/lib/bioserver
+
+  biofpm:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/fpm.Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+      target: ${APP_ENV:-production}
+    env_file: .env
+    environment:
+      DB_ENGINE: sqlite
+      DB_SQLITE_PATH: /var/lib/bioserver/bioserver.sqlite
+    depends_on:
+      biosqlite-init:
+        condition: service_completed_successfully
+    volumes:
+      - sqlite-data:/var/lib/bioserver
+    networks: [bio-network]
+
+  bio1server:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile
+      args:
+        SERVER_PATH: ./bioserv1/bioserver
+        RUN_FILE_PATH: ./bioserv1/run_file1.sh
+    env_file: .env
+    environment:
+      DB_ENGINE: sqlite
+      DB_SQLITE_PATH: /var/lib/bioserver/bioserver.sqlite
+      SERVER_IP: ${SERVER_IP}
+    depends_on:
+      biosqlite-init:
+        condition: service_completed_successfully
+    volumes:
+      - sqlite-data:/var/lib/bioserver
+    ports:
+      - "8300:8300"
+      - "8690:8690"
+    networks: [bio-network]
+
+  bio2server:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile
+      args:
+        SERVER_PATH: ./bioserv2/bioserver
+        RUN_FILE_PATH: ./bioserv2/run_file2.sh
+    env_file: .env
+    environment:
+      DB_ENGINE: sqlite
+      DB_SQLITE_PATH: /var/lib/bioserver/bioserver.sqlite
+      SERVER_IP: ${SERVER_IP}
+    depends_on:
+      biosqlite-init:
+        condition: service_completed_successfully
+    volumes:
+      - sqlite-data:/var/lib/bioserver
+    ports:
+      - "8200:8200"
+      - "8590:8590"
+    networks: [bio-network]
+
+  biogateway:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    depends_on: [biofpm]
+    networks: [bio-network]
+
+  biodns:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/dns.Dockerfile
+    environment:
+      SERVER_IP: ${SERVER_IP}
+      ROUTER_IP: ${ROUTER_IP}
+    ports:
+      - "${DNS_PORT:-53}:53/udp"
+    cap_add: [NET_ADMIN]
+
+networks:
+  bio-network:
+    name: bio-network
+    driver: bridge
+
+volumes:
+  sqlite-data:
+    driver: local

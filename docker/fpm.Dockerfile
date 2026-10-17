@@ -1,6 +1,6 @@
 FROM php:8.3-fpm AS base
 
-RUN docker-php-ext-install pdo pdo_mysql mysqli && \
+RUN docker-php-ext-install pdo pdo_mysql pdo_sqlite mysqli && \
     docker-php-ext-enable mysqli && \
     apt-get update && apt-get install -y --no-install-recommends unzip && \
     mkdir /home/www-data && \
