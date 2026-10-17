@@ -252,6 +252,126 @@ jobs:
           path: reports
           if-no-files-found: error
 
+
+  sqlite-import-regression:
+    name: Verified offline MySQL to SQLite import
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:9.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bioserver
+          MYSQL_USER: bioserver
+          MYSQL_PASSWORD: bioserver
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      SOURCE_DB_HOST: 127.0.0.1
+      SOURCE_DB_NAME: bioserver
+      SOURCE_DB_USER: bioserver
+      SOURCE_DB_PASSWORD: bioserver
+      DB_HOST: 127.0.0.1
+      DB_DATABASE: bioserver
+      DB_USER: bioserver
+      DB_PASSWORD: bioserver
+      SYNTHETIC_DB_FIXTURE: '1'
+      DB_SQLITE_PATH: /tmp/bioserver-imported.sqlite
+      DB_ENGINE: mysql
+      APP_ENV: production
+      FORCE_DEV_LOGIN: 'false'
+      OPENSSL_CONF: ${{ github.workspace }}/docker/vars/web/openssl.cnf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, pdo_mysql, mbstring
+          tools: composer:v2
+      - name: Set up synthetic source MySQL and empty destination SQLite
+        run: |
+          docker exec -i -e DB_DATABASE=bioserver "${{ job.services.mysql.id }}" sh -s < docker/vars/mysql/2_init_db.sh
+          php web/tests/fixtures/seed_synthetic.php
+          python docker/vars/sqlite/init_db.py "$DB_SQLITE_PATH"
+      - name: Preflight, verified import and safety gates
+        run: |
+          mkdir -p reports/migration
+          php tests/migration/mysql_to_sqlite.php --check --sqlite="$DB_SQLITE_PATH" > reports/migration/preflight.json
+          php tests/migration/mysql_to_sqlite.php --apply --ack-offline --ack-collation-change             --sqlite="$DB_SQLITE_PATH" > reports/migration/import.json
+          if php tests/migration/mysql_to_sqlite.php --apply --ack-offline --ack-collation-change --sqlite="$DB_SQLITE_PATH"; then
+            echo "Unsafe repeated import succeeded!" >&2
+            exit 1
+          fi
+          if php tests/migration/mysql_to_sqlite.php --apply --sqlite="$DB_SQLITE_PATH"; then
+            echo "Import succeeded without acknowledgements!" >&2
+            exit 1
+          fi
+      - name: Run full PHP tests on migrated data
+        env:
+          DB_ENGINE: sqlite
+        run: |
+          cd web
+          composer install --no-interaction --prefer-dist
+          composer test
+      - name: Reject MySQL session duplicates in preflight
+        run: |
+          php -r '$db=new PDO("mysql:host=127.0.0.1;dbname=bioserver;charset=utf8mb4","bioserver","bioserver"); $db->exec("INSERT INTO sessions (userid,ip,port,sessid,gameid) SELECT userid,ip,port,sessid,gameid FROM sessions WHERE sessid=\x2787654321\x27 AND gameid=\x2700000002\x27 LIMIT 1");'
+          if php tests/migration/mysql_to_sqlite.php --check --sqlite="$DB_SQLITE_PATH"; then
+            echo "Duplicate-session source passed migration preflight!" >&2
+            exit 1
+          fi
+      - name: Upload migration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-sqlite-migration-evidence
+          path: reports/migration
+          if-no-files-found: warn
+
+  sqlite-docker-smoke:
+    name: Build and boot real SQLite Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare nonproduction Docker settings
+        run: |
+          cp .env.example .env
+          sed -i 's/^SERVER_IP=$/SERVER_IP=127.0.0.1/' .env
+          sed -i 's/^ROUTER_IP=$/ROUTER_IP=127.0.0.1/' .env
+      - name: Compose config must not start MySQL
+        run: |
+          docker compose --project-directory . -f docker/sqlite/compose.yaml config --quiet
+          if docker compose --project-directory . -f docker/sqlite/compose.yaml config --services | grep -q biomysql; then
+            echo "MySQL accidentally included in SQLite deployment" >&2
+            exit 1
+          fi
+      - name: Build both Java servers and production PHP image
+        run: |
+          docker compose --project-directory . -f docker/sqlite/compose.yaml build biofpm bio1server bio2server
+      - name: Boot PHP and two Java processes on shared SQLite WAL volume
+        run: |
+          docker compose --project-directory . -f docker/sqlite/compose.yaml up -d biosqlite-init biofpm bio1server bio2server
+          sleep 8
+          docker compose --project-directory . -f docker/sqlite/compose.yaml ps
+          for service in biofpm bio1server bio2server; do
+            container="$(docker compose --project-directory . -f docker/sqlite/compose.yaml ps -q "$service")"
+            test -n "$container"
+            test "$(docker inspect -f '{{.State.Running}}' "$container")" = true
+          done
+          docker compose --project-directory . -f docker/sqlite/compose.yaml exec -T biofpm             php -r '$db=new PDO("sqlite:/var/lib/bioserver/bioserver.sqlite"); $result=$db->query("PRAGMA journal_mode")->fetchColumn(); if ($result !== "wal") exit(1);'
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose --project-directory . -f docker/sqlite/compose.yaml logs --no-color
+      - name: Shut down test containers
+        if: always()
+        run: docker compose --project-directory . -f docker/sqlite/compose.yaml down -v --remove-orphans
+
   coverage-report:
     name: Aggregate coverage by component
     if: always()
