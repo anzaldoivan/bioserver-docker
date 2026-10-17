@@ -10,6 +10,8 @@ REPORTS = (
     ("SQLite initializer / Python", "python/sqlite/coverage.xml", "cobertura"),
     ("File #1 JDBC / Java", "java/bio1/jacoco.xml", "jacoco"),
     ("File #2 JDBC / Java", "java/bio2/jacoco.xml", "jacoco"),
+    ("File #1 SQLite JDBC / Java", "java-sqlite/bio1/jacoco.xml", "jacoco"),
+    ("File #2 SQLite JDBC / Java", "java-sqlite/bio2/jacoco.xml", "jacoco"),
 )
 
 
@@ -50,7 +52,7 @@ def render(base: Path) -> str:
     lines += [
         "",
         "Source coverage is per component and backend; **no cross-language average is calculated**.",
-        "Java executes real JDBC against MySQL only; SQLite JDBC support is not implemented yet.",
+        "Both game server JDBC implementations execute on MySQL and SQLite in separate CI jobs.",
         "These metrics do not certify PS2 gameplay behavior or a real-data migration.",
     ]
     return "\n".join(lines) + "\n"

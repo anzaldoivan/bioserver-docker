@@ -189,10 +189,73 @@ jobs:
           path: reports
           if-no-files-found: warn
 
+
+  java-sqlite-regression:
+    name: Java File 1/2 real SQLite JDBC with JaCoCo
+    runs-on: ubuntu-latest
+    env:
+      DB_ENGINE: sqlite
+      DB_SQLITE_PATH: /tmp/bioserver-java.sqlite
+      SYNTHETIC_DB_FIXTURE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite
+      - name: Initialize and seed same SQLite database PHP will use
+        run: |
+          python docker/vars/sqlite/init_db.py "$DB_SQLITE_PATH"
+          php web/tests/fixtures/seed_synthetic.php
+      - name: Download pinned JDBC and coverage dependencies
+        run: |
+          mkdir -p /tmp/bio-drivers
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/xerial/sqlite-jdbc/3.53.4.0/sqlite-jdbc-3.53.4.0.jar -o /tmp/bio-drivers/sqlite-jdbc.jar
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar -o /tmp/bio-drivers/slf4j-api.jar
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.agent/0.8.13/org.jacoco.agent-0.8.13-runtime.jar -o /tmp/bio-drivers/jacocoagent.jar
+          curl -fLsS --retry 3 https://repo.maven.apache.org/maven2/org/jacoco/org.jacoco.cli/0.8.13/org.jacoco.cli-0.8.13-nodeps.jar -o /tmp/bio-drivers/jacococli.jar
+      - name: Compile File 1 and File 2 independently
+        run: |
+          mkdir -p out/java/bio1 out/java/bio2
+          javac -d out/java/bio1 bioserv1/bioserver/*.java tests/java/DatabaseSmoke.java
+          javac -d out/java/bio2 bioserv2/bioserver/*.java tests/java/DatabaseSmoke.java
+      - name: Execute both JDBC implementations on SAME WAL database
+        run: |
+          for game in bio1 bio2; do
+            mkdir -p "reports/java-sqlite/$game"
+            if [ "$game" = bio1 ]; then
+              id="00000002"; user="fixture_a"; session="87654321"; source="bioserv1"
+            else
+              id="00000010"; user="fixture_b"; session="87654322"; source="bioserv2"
+            fi
+            java -javaagent:/tmp/bio-drivers/jacocoagent.jar=destfile="reports/java-sqlite/$game/jacoco.exec"               -cp "out/java/$game:/tmp/bio-drivers/*" DatabaseSmoke "$id" "$user" "$session"
+            java -jar /tmp/bio-drivers/jacococli.jar report "reports/java-sqlite/$game/jacoco.exec"               --classfiles "out/java/$game/bioserver" --sourcefiles "$source"               --xml "reports/java-sqlite/$game/jacoco.xml"
+          done
+      - name: Reject missing SQLite database at startup
+        run: |
+          if DB_SQLITE_PATH=/tmp/not-created-bioserver.sqlite             java -cp "out/java/bio1:/tmp/bio-drivers/*" DatabaseSmoke 00000002 fixture_a 87654321; then
+            echo "Java SQLite startup unexpectedly accepted a missing DB" >&2
+            exit 1
+          fi
+      - name: Upload SQLite Java coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-java-sqlite
+          path: reports
+          if-no-files-found: error
+
   coverage-report:
     name: Aggregate coverage by component
     if: always()
-    needs: [sqlite-contract, php-regression, java-db-smoke]
+    needs: [sqlite-contract, php-regression, java-db-smoke, java-sqlite-regression]
     runs-on: ubuntu-latest
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
@@ -221,6 +284,6 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ env.CODECOV_TOKEN }}
-          files: coverage-input/php/sqlite/cobertura.xml,coverage-input/php/mysql/cobertura.xml,coverage-input/python/sqlite/coverage.xml,coverage-input/java/bio1/jacoco.xml,coverage-input/java/bio2/jacoco.xml
+          files: coverage-input/php/sqlite/cobertura.xml,coverage-input/php/mysql/cobertura.xml,coverage-input/python/sqlite/coverage.xml,coverage-input/java/bio1/jacoco.xml,coverage-input/java/bio2/jacoco.xml,coverage-input/java-sqlite/bio1/jacoco.xml,coverage-input/java-sqlite/bio2/jacoco.xml
           flags: bioserver-ci
           fail_ci_if_error: false
